@@ -8,14 +8,27 @@ import threading
 import uuid
 import zipfile
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .imaging import RGB, Page, colour_to_hex
-from .pipeline import Analysis, legend_entries, render_page
+from .boundary import (
+    BoundaryPlan,
+    BoundarySolution,
+    Rect,
+    apply_cuts,
+    plan_boundary_edit,
+)
+from .imaging import RGB, InputError, Page, colour_to_hex
+from .pipeline import (
+    Analysis,
+    analyse_pages,
+    legend_entries,
+    render_labels_png,
+    render_page,
+)
 from .solver import SolveResult, colour_distance, solve_colouring
 
 
@@ -47,6 +60,7 @@ class Bundle:
     total_error: int
     legend: list[dict]
     pages_png: list[bytes]
+    labels_png: list[bytes]
     legend_json: bytes
     legend_png: bytes
     created_at: str
@@ -58,6 +72,8 @@ class Bundle:
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for index, data in enumerate(self.pages_png, start=1):
                 archive.writestr(f"page_{index:02d}.png", data)
+            for index, data in enumerate(self.labels_png, start=1):
+                archive.writestr(f"labels_{index:02d}.png", data)
             archive.writestr("legend.json", self.legend_json)
             archive.writestr("legend.png", self.legend_png)
             archive.writestr(
@@ -73,12 +89,35 @@ class Bundle:
                             f"page_{i:02d}.png"
                             for i in range(1, len(self.pages_png) + 1)
                         ]
+                        + [
+                            f"labels_{i:02d}.png"
+                            for i in range(1, len(self.labels_png) + 1)
+                        ]
                         + ["legend.json", "legend.png"],
                     },
                     indent=2,
                 ).encode(),
             )
         return buffer.getvalue()
+
+
+@dataclass
+class BoundaryEditJob:
+    """Immutable snapshot of a validated boundary edit, taken at accept time.
+
+    The job is solved without holding the package lock, so other edits may
+    still be accepted meanwhile; ``commit_boundary_edit`` re-checks the
+    version before publishing.
+    """
+
+    version: int
+    page_number: int
+    plan: BoundaryPlan
+    pages: list[Page]
+    analysis: Analysis
+    palette: list[RGB]
+    min_distance: float
+    locks: dict[int, int]
 
 
 @dataclass
@@ -237,6 +276,132 @@ class PackageStore:
             package.published.add(next_number)
             return _summary_locked(package)
 
+    # -- boundary edits ---------------------------------------------------
+    def begin_boundary_edit(
+        self,
+        package_id: str,
+        *,
+        version: int,
+        page_number: int,
+        left: int,
+        right: int,
+        rect: Rect,
+    ) -> BoundaryEditJob:
+        """Validate a boundary edit and snapshot the inputs for solving.
+
+        Runs under the package lock so the snapshot is consistent; the
+        (potentially slow) search itself happens on the returned job without
+        the lock, so locks and versions can keep moving meanwhile.
+        """
+        package = self.get(package_id)
+        with package.lock:
+            current = package.current
+            if current is None:
+                raise NotFoundError(package_id)
+            if version != current.number:
+                raise VersionConflictError(
+                    f"the boundary edit is based on version {version}, but the "
+                    f"current version is {current.number}; re-base it and retry",
+                    current.number,
+                )
+            if not 1 <= page_number <= len(package.pages):
+                raise InputError(
+                    f"page {page_number} does not exist; the package has "
+                    f"{len(package.pages)} page(s)"
+                )
+            if left == right:
+                raise InputError("left_label and right_label must differ")
+            unknown = [
+                label
+                for label in (left, right)
+                if label not in package.analysis.costs
+            ]
+            if unknown:
+                raise InputError(
+                    f"labels not present in this package: {unknown}"
+                )
+            page_index = page_number - 1
+            plan = plan_boundary_edit(
+                package.pages[page_index], page_index, left, right, rect
+            )
+            return BoundaryEditJob(
+                version=current.number,
+                page_number=page_number,
+                plan=plan,
+                pages=list(package.pages),
+                analysis=package.analysis,
+                palette=list(package.palette),
+                min_distance=package.min_distance,
+                locks=dict(package.locks),
+            )
+
+    def commit_boundary_edit(
+        self, package_id: str, job: BoundaryEditJob, solution: BoundarySolution
+    ) -> dict[str, Any]:
+        """Publish a solved boundary edit as a new version.
+
+        The version is re-checked under the lock: if another edit or lock
+        moved the package on while the search ran, the solved boundary is
+        discarded with a version conflict and the current package is kept.
+        """
+        package = self.get(package_id)
+        with package.lock:
+            current = package.current
+            if current is None:
+                raise NotFoundError(package_id)
+            if current.number != job.version:
+                raise VersionConflictError(
+                    f"version {job.version} was superseded by version "
+                    f"{current.number} while the boundary edit was computed; "
+                    "the edit was not applied",
+                    current.number,
+                )
+            page_index = job.plan.page_index
+            page = package.pages[page_index]
+            new_labels = apply_cuts(page, job.plan, solution.cuts)
+            new_pages = list(package.pages)
+            new_pages[page_index] = replace(page, labels=new_labels)
+            new_analysis = analyse_pages(new_pages, package.palette)
+            next_number = current.number + 1
+            plan = job.plan
+            change = {
+                "type": "boundary_edit",
+                "page": job.page_number,
+                "left_label": plan.left,
+                "right_label": plan.right,
+                "other_label": plan.other,
+                "rect": {
+                    "x": plan.rect.x,
+                    "y": plan.rect.y,
+                    "width": plan.rect.width,
+                    "height": plan.rect.height,
+                },
+                "cuts": solution.cuts,
+                "score": solution.score,
+                "search": {
+                    "dp_states": solution.dp_states,
+                    "cut_vectors": solution.cut_vectors,
+                    "feasible_masks": solution.feasible_masks,
+                },
+                "previous_version": current.number,
+            }
+            # Locks cannot have changed while the version is pinned, so the
+            # pre-checked feasibility still holds; the bundle is fully built
+            # before any state is mutated, keeping the edit all-or-nothing.
+            bundle = _compute_bundle(
+                package,
+                package.locks,
+                next_number,
+                change,
+                pages=new_pages,
+                analysis=new_analysis,
+            )
+            package.pages = new_pages
+            package.analysis = new_analysis
+            package.current = bundle
+            package.published.add(next_number)
+            return _summary_locked(package)
+
 
 def _lock_delta(
     previous: dict[int, int],
@@ -283,23 +448,30 @@ def _compute_bundle(
     locks: dict[int, int],
     number: int,
     change: dict[str, Any],
+    pages: Sequence[Page] | None = None,
+    analysis: Analysis | None = None,
 ) -> Bundle:
-    labels = package.analysis.labels
+    if pages is None:
+        pages = package.pages
+    if analysis is None:
+        analysis = package.analysis
+    labels = analysis.labels
     index = {label: i for i, label in enumerate(labels)}
-    costs = [package.analysis.costs[label] for label in labels]
-    edges = [(index[a], index[b]) for a, b in sorted(package.analysis.edges)]
+    costs = [analysis.costs[label] for label in labels]
+    edges = [(index[a], index[b]) for a, b in sorted(analysis.edges)]
     local_locks = {index[label]: colour_index for label, colour_index in locks.items()}
     result = solve_colouring(
         costs, edges, package.palette, package.min_distance, local_locks
     )
     if result.assignment is None:
-        raise InfeasibleError(result, _conflict_details(package, result, locks))
+        raise InfeasibleError(
+            result, _conflict_details(package, result, locks, analysis)
+        )
 
     assignment = {label: result.assignment[index[label]] for label in labels}
-    legend = legend_entries(package.analysis, assignment, package.palette, locks)
-    pages_png = [
-        render_page(page, assignment, package.palette) for page in package.pages
-    ]
+    legend = legend_entries(analysis, assignment, package.palette, locks)
+    pages_png = [render_page(page, assignment, package.palette) for page in pages]
+    labels_png = [render_labels_png(page) for page in pages]
     created_at = _now()
     legend_payload = {
         "package_id": package.id,
@@ -318,12 +490,13 @@ def _compute_bundle(
             {
                 "page": page.index,
                 "file": f"page_{page.index:02d}.png",
+                "labels": f"labels_{page.index:02d}.png",
                 "width": page.width,
                 "height": page.height,
                 "source_rgb": page.rgb_name,
                 "source_labels": page.label_name,
             }
-            for page in package.pages
+            for page in pages
         ],
     }
     legend_json = json.dumps(legend_payload, indent=2, ensure_ascii=False).encode()
@@ -334,6 +507,7 @@ def _compute_bundle(
         total_error=int(result.total_cost),
         legend=legend,
         pages_png=pages_png,
+        labels_png=labels_png,
         legend_json=legend_json,
         legend_png=legend_png,
         created_at=created_at,
@@ -346,7 +520,10 @@ def _compute_bundle(
 
 
 def _conflict_details(
-    package: Package, result: SolveResult, locks: dict[int, int]
+    package: Package,
+    result: SolveResult,
+    locks: dict[int, int],
+    analysis: Analysis | None = None,
 ) -> dict[str, Any]:
     """Turn a solver conflict into an operator-facing explanation.
 
@@ -354,7 +531,9 @@ def _conflict_details(
     distance that is impossible for mutually touching labels, and locks that
     make an otherwise solvable set infeasible.
     """
-    labels = package.analysis.labels
+    if analysis is None:
+        analysis = package.analysis
+    labels = analysis.labels
     conflict = result.conflict
     details: dict[str, Any] = {
         "conflict": True,
@@ -415,15 +594,15 @@ def _conflict_details(
     details["edges"] = [
         {
             "labels": [a, b],
-            "pages": [page + 1 for page in package.analysis.edge_pages[(a, b)]],
+            "pages": [page + 1 for page in analysis.edge_pages[(a, b)]],
         }
-        for a, b in sorted(package.analysis.edges)
+        for a, b in sorted(analysis.edges)
         if a in focus or b in focus
     ]
 
     # A clique larger than the palette's compatibility clique cannot be
     # coloured, regardless of costs.  At most 12 labels, so subsets are cheap.
-    clique = _max_clique(package.analysis.edges, labels)
+    clique = _max_clique(analysis.edges, labels)
     allowed = details["max_compatible_colours"]
     if clique and len(clique) > allowed:
         details["clique"] = {
@@ -433,7 +612,7 @@ def _conflict_details(
                     page + 1
                     for i, a in enumerate(clique)
                     for b in clique[i + 1 :]
-                    for page in package.analysis.edge_pages.get(
+                    for page in analysis.edge_pages.get(
                         (min(a, b), max(a, b)), []
                     )
                 }
@@ -452,8 +631,8 @@ def _conflict_details(
     # cause for the operator and justifies keeping the old package on 409.
     if locks:
         index = {label: i for i, label in enumerate(labels)}
-        costs = [package.analysis.costs[label] for label in labels]
-        edges = [(index[a], index[b]) for a, b in sorted(package.analysis.edges)]
+        costs = [analysis.costs[label] for label in labels]
+        edges = [(index[a], index[b]) for a, b in sorted(analysis.edges)]
         unlocked = solve_colouring(
             costs, edges, package.palette, package.min_distance, {}
         )

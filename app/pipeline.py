@@ -140,6 +140,14 @@ def render_page(
     return buffer.getvalue()
 
 
+def render_labels_png(page: Page) -> bytes:
+    """Render the (possibly revised) label map as an 8-bit grayscale PNG."""
+    image = Image.frombytes("L", (page.width, page.height), page.labels)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", compress_level=6)
+    return buffer.getvalue()
+
+
 def legend_entries(
     analysis: Analysis,
     assignment: dict[int, int],

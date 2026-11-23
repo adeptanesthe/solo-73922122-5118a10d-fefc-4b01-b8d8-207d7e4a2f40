@@ -5,3 +5,4 @@ __pycache__/
 .ruff_cache/
 demo/pages/
 demo/out/
+demo/boundary_pages/

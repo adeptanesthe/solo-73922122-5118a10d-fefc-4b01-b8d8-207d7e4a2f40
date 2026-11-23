@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from .boundary import Rect, solve_boundary
 from .imaging import (
     MAX_PAGES,
     MAX_UPLOAD_BYTES,
@@ -56,11 +57,49 @@ class LockRequest(BaseModel):
     )
 
 
+class RectModel(BaseModel):
+    x: int = Field(..., ge=0, description="left edge of the edit rectangle")
+    y: int = Field(..., ge=0, description="top edge of the edit rectangle")
+    width: int = Field(..., ge=1, le=24, description="at most 24 pixels")
+    height: int = Field(..., ge=1, le=24, description="at most 24 pixels")
+
+
+class BoundaryEditRequest(BaseModel):
+    version: int = Field(
+        ..., ge=1, description="current package version the edit is based on"
+    )
+    page: int = Field(..., ge=1, description="1-based page number to edit")
+    left_label: int = Field(
+        ..., ge=0, le=255, description="label assigned left of each cut"
+    )
+    right_label: int = Field(
+        ..., ge=0, le=255, description="label assigned right of each cut"
+    )
+    rect: RectModel
+
+
 def _error(status: int, code: str, message: str, **extra: Any) -> JSONResponse:
     payload: dict[str, Any] = {"error": {"code": code, "message": message}}
     if extra:
         payload["error"].update(extra)
     return JSONResponse(status_code=status, content=payload)
+
+
+def _version_conflict(package_id: str, exc: VersionConflictError) -> JSONResponse:
+    """409 for a stale base version, reporting the kept current package."""
+    try:
+        kept = store.describe(package_id)
+    except NotFoundError:
+        return _error(404, "package_not_found", "no such package")
+    return _error(
+        409,
+        "version_conflict",
+        str(exc),
+        current_version=exc.current_version,
+        kept_version=kept["version"],
+        kept_locks=kept["locks"],
+        kept_download_url=kept["download_url"],
+    )
 
 
 def _parse_locks(raw: str | None, palette) -> dict[int, int]:
@@ -238,6 +277,88 @@ async def unlock_label(package_id: str, label: int):
         )
 
 
+@app.post("/api/packages/{package_id}/boundary-edits")
+async def boundary_edit(package_id: str, request: BoundaryEditRequest):
+    """Re-draw the boundary between two labels inside a small rectangle.
+
+    The edit is validated and snapshotted under the package lock, solved
+    off-lock (other edits may proceed), and published only if the package
+    is still at the requested version.
+    """
+    rect = Rect(
+        x=request.rect.x,
+        y=request.rect.y,
+        width=request.rect.width,
+        height=request.rect.height,
+    )
+    try:
+        job = store.begin_boundary_edit(
+            package_id,
+            version=request.version,
+            page_number=request.page,
+            left=request.left_label,
+            right=request.right_label,
+            rect=rect,
+        )
+    except NotFoundError:
+        return _error(404, "package_not_found", "no such package")
+    except InputError as exc:
+        return _error(422, "invalid_input", str(exc))
+    except VersionConflictError as exc:
+        return _version_conflict(package_id, exc)
+
+    # The search is CPU-bound and must not block other edits: run it on the
+    # snapshot in a worker thread, without holding the package lock.
+    solution = await run_in_threadpool(
+        solve_boundary,
+        job.pages,
+        job.analysis,
+        job.palette,
+        job.min_distance,
+        job.locks,
+        job.plan,
+    )
+    if solution is None:
+        kept = store.describe(package_id)
+        return _error(
+            409,
+            "no_feasible_boundary",
+            "no cut placement inside the rectangle keeps the whole set "
+            "colourable under the minimum colour distance and the active "
+            "locks; the current package was kept",
+            details={
+                "page": request.page,
+                "left_label": request.left_label,
+                "right_label": request.right_label,
+                "other_label": job.plan.other,
+                "rect": request.rect.model_dump(),
+                "locks": kept["locks"],
+            },
+            kept_version=kept["version"],
+            kept_locks=kept["locks"],
+            kept_download_url=kept["download_url"],
+        )
+    try:
+        return await run_in_threadpool(
+            store.commit_boundary_edit, package_id, job, solution
+        )
+    except VersionConflictError as exc:
+        return _version_conflict(package_id, exc)
+    except InfeasibleError as exc:
+        # Defensive: the pre-checked feasibility cannot change while the
+        # version is pinned, but never leave the package half-edited.
+        kept = store.describe(package_id)
+        return _error(
+            409,
+            "infeasible",
+            exc.details.get("message", "no feasible colouring"),
+            details=exc.details,
+            kept_version=kept["version"],
+            kept_locks=kept["locks"],
+            kept_download_url=kept["download_url"],
+        )
+
+
 @app.get("/api/packages/{package_id}/versions/{version}/download")
 def download_version(package_id: str, version: int):
     try:
@@ -302,6 +423,31 @@ def download_page(package_id: str, version: int, page: int):
         return _error(404, "page_not_found", f"page {page} does not exist")
     return Response(
         content=bundle.pages_png[page - 1],
+        media_type="image/png",
+        headers={"X-Package-Version": str(bundle.number)},
+    )
+
+
+@app.get("/api/packages/{package_id}/versions/{version}/labels/{page}")
+def download_labels(package_id: str, version: int, page: int):
+    """The label map published with this version (revised by boundary edits)."""
+    try:
+        bundle = store.get_bundle(package_id, version)
+    except VersionNotFoundError as exc:
+        return _error(404, "version_not_found", str(exc))
+    except NotFoundError:
+        return _error(404, "package_not_found", "no such package")
+    except VersionConflictError as exc:
+        return _error(
+            409,
+            "version_conflict",
+            str(exc),
+            current_version=exc.current_version,
+        )
+    if not 1 <= page <= len(bundle.labels_png):
+        return _error(404, "page_not_found", f"page {page} does not exist")
+    return Response(
+        content=bundle.labels_png[page - 1],
         media_type="image/png",
         headers={"X-Package-Version": str(bundle.number)},
     )

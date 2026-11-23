@@ -90,6 +90,7 @@ def test_create_and_download(client: TestClient) -> None:
     archive = zipfile.ZipFile(io.BytesIO(download.content))
     names = sorted(archive.namelist())
     assert names == [
+        "labels_01.png",
         "legend.json",
         "legend.png",
         "manifest.json",
@@ -101,6 +102,11 @@ def test_create_and_download(client: TestClient) -> None:
     pixels = page.tobytes()
     assert pixels[0:3] == bytes((255, 255, 255))
     assert pixels[3:6] == bytes((0, 0, 0))
+
+    # The published label map matches the uploaded one.
+    labels = Image.open(io.BytesIO(archive.read("labels_01.png")))
+    assert labels.mode == "L"
+    assert list(labels.tobytes()) == [1, 2, 1, 2]
 
 
 def test_ssim_style_error_is_minimal(client: TestClient) -> None:

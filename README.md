@@ -18,6 +18,14 @@ version number.
   all `K**N` assignments.
 * Locks (label → palette colour) are stored per package. Locking or unlocking
   any label re-solves the whole set, so colours on other pages can change.
+* A boundary edit re-draws the frontier between two labels inside a ≤24×24
+  rectangle: one cut per row between two adjacent editable pixels, adjacent
+  rows offset by at most one pixel. The chosen boundary maximises the summed
+  squared RGB contrast across the cuts among all boundaries that keep the
+  set colourable under `min_distance` and the active locks; ties prefer the
+  top-down left-most cut vector. The search is a dynamic program over
+  `(row, cut, contact mask)` states — it never enumerates the O(23²⁴) cut
+  vectors (see *Boundary edits* below).
 * An edit is all-or-nothing. If the new locks have no feasible assignment the
   request returns `409` with the conflict reason, and the current package and
   locks are untouched.
@@ -72,12 +80,59 @@ Both edits publish a new version on success. On failure they return `409`
 with `details` (conflict type, labels, colour pairs, whether the locks caused
 it), `kept_version`, `kept_locks` and `kept_download_url`.
 
+### `POST /api/packages/{id}/boundary-edits`
+
+Re-draw the boundary between two labels on one page. Body:
+
+```jsonc
+{
+  "version": 2,                 // current package version the edit is based on
+  "page": 1,                    // 1-based page number
+  "left_label": 96,             // label placed left of each cut
+  "right_label": 32,            // label placed right of each cut
+  "rect": {"x": 24, "y": 20, "width": 16, "height": 12}   // at most 24x24
+}
+```
+
+Rules enforced inside the rectangle:
+
+* each row picks a cut between two adjacent pixels that both carry one of the
+  two labels; neighbouring rows' cuts differ by at most one pixel;
+* only pixels carrying the two labels are re-assigned (left of the cut →
+  `left_label`, right of the cut → `right_label`);
+* the rectangle plus the outside pixels sharing an edge with it may contain
+  at most one other label (`422` otherwise).
+
+The service scores every boundary on the **original** page (sum over rows of
+the squared RGB distance between the two pixels flanking the cut) and returns
+the highest-scoring boundary that still admits a colouring under the original
+`min_distance` and the active locks. Ties are broken top-down, preferring the
+cut that is further left first.
+
+The request is validated and snapshotted under the package lock, but the
+search runs **without** the lock, so locks and versions can keep moving while
+it is computed. If the submitted `version` is stale when the request is
+accepted or when the result is written, the edit is discarded with `409`
+`version_conflict` and the current package is kept. If no boundary stays
+colourable, the response is `409` `no_feasible_boundary` with
+`kept_version`/`kept_locks`/`kept_download_url`.
+
+On success (`200`) the response is the usual package summary whose
+`change.type` is `boundary_edit`, carrying the chosen `cuts` (one per
+rectangle row, top to bottom), the `score`, and `search` telemetry
+(`dp_states` vs. the `cut_vectors` space size). The revised label maps, the
+recoloured page PNGs and the legend are published together as the next
+version; the download ZIP and `legend.json` list `labels_NN.png` alongside
+`page_NN.png`.
+
 ### Downloads (current version only)
 
 * `GET /api/packages/{id}/versions/{v}/download` — ZIP with `page_NN.png`,
-  `legend.json`, `legend.png`, `manifest.json`
+  `labels_NN.png`, `legend.json`, `legend.png`, `manifest.json`
 * `GET /api/packages/{id}/versions/{v}/legend.json`
 * `GET /api/packages/{id}/versions/{v}/pages/{n}`
+* `GET /api/packages/{id}/versions/{v}/labels/{n}` — the label map published
+  with that version (revised by boundary edits)
 
 Stale versions return `409`; versions never published return `404`.
 
@@ -95,6 +150,41 @@ to the ochre colour, because those labels touch on every page where both
 appear. It then requests an impossible lock (rule and seal both blue while
 touching), shows the `409` with preserved version/locks, and shows a stale
 version download returning `409`.
+
+## Demo: a lock excludes the highest-scoring boundary
+
+```bash
+python3 demo/make_boundary_demo_pages.py     # builds demo/boundary_pages/*.png
+docker compose up --build                    # in another terminal
+bash demo/boundary_edit_demo.sh              # BASE=... to target another host
+```
+
+The boundary demo page has a rule band left of a sky band with a one-column
+seal inside the sky band. The unconstrained best boundary hugs the seal
+(highest original contrast, score 2,073,600) and creates a rule/seal contact.
+On a second, identical package the seal is locked to the palette red — a
+colour only the paper colour is far enough from. Because the sky already
+touches the seal and the rule always touches the sky after an edit, every
+seal-touching boundary becomes infeasible, and the same request then returns
+the best feasible boundary left of the seal (score 239,784). The script ends
+with a stale-version edit returning `409` `version_conflict`.
+
+## Boundary solver
+
+A 24×24 rectangle admits O(23²⁴) cut vectors, so the search does not
+enumerate them. Two structural facts make it exact:
+
+1. The score is separable per row and the one-pixel smoothness rule couples
+   only adjacent rows — a plain row-by-row dynamic program.
+2. The "at most one other label" rule means re-labelling can only create
+   contacts among `{left, right, other}`. The cut always joins left and
+   right, so the whole cut vector influences colourability only through a
+   two-bit contact mask (`left-other`, `right-other`). Feasibility is
+   cost-independent, so each of the four masks is checked once with the
+   exact colouring solver, and the DP state is `(row, cut, mask)` — at most
+   24×24×4 states, keeping the best `(score, cut vector)` prefix per state
+   with the top-down left-most tie-break. `tests/test_boundary.py` checks
+   the DP against brute-force enumeration on random rectangles.
 
 ## Solver
 
